@@ -370,13 +370,13 @@
         ]
       },
       {
-        "name": "Audio -> Video -> Audio",
+        "name": "Audio -> Audio -> Audio",
         "playlist": [
           {
             "uri": "https://storage.googleapis.com/exoplayer-test-media-1/gen-3/screens/dash-vod-single-segment/audio-141.mp4"
           },
           {
-            "uri": "https://storage.googleapis.com/exoplayer-test-media-1/mkv/android-screens-lavf-56.36.100-aac-avc-main-1280x720.mkv"
+            "uri": "https://audio-previews.elements.envatousercontent.com/files/103682271/preview.mp3"
           },
           {
             "uri": "https://storage.googleapis.com/exoplayer-test-media-1/gen-3/screens/dash-vod-single-segment/audio-141.mp4"

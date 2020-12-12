@@ -39,8 +39,6 @@ import com.google.android.exoplayer2.Player;
 import com.google.android.exoplayer2.RenderersFactory;
 import com.google.android.exoplayer2.SimpleExoPlayer;
 import com.google.android.exoplayer2.audio.AudioAttributes;
-import com.google.android.exoplayer2.drm.FrameworkMediaDrm;
-import com.google.android.exoplayer2.ext.ima.ImaAdsLoader;
 import com.google.android.exoplayer2.mediacodec.MediaCodecRenderer.DecoderInitializationException;
 import com.google.android.exoplayer2.mediacodec.MediaCodecUtil.DecoderQueryException;
 import com.google.android.exoplayer2.offline.DownloadRequest;
@@ -48,24 +46,20 @@ import com.google.android.exoplayer2.source.BehindLiveWindowException;
 import com.google.android.exoplayer2.source.DefaultMediaSourceFactory;
 import com.google.android.exoplayer2.source.MediaSourceFactory;
 import com.google.android.exoplayer2.source.TrackGroupArray;
-import com.google.android.exoplayer2.source.ads.AdsLoader;
 import com.google.android.exoplayer2.trackselection.DefaultTrackSelector;
 import com.google.android.exoplayer2.trackselection.MappingTrackSelector.MappedTrackInfo;
 import com.google.android.exoplayer2.trackselection.TrackSelectionArray;
-import com.google.android.exoplayer2.ui.DebugTextViewHelper;
 import com.google.android.exoplayer2.ui.StyledPlayerControlView;
 import com.google.android.exoplayer2.ui.StyledPlayerView;
 import com.google.android.exoplayer2.upstream.DataSource;
 import com.google.android.exoplayer2.util.ErrorMessageProvider;
 import com.google.android.exoplayer2.util.EventLogger;
+import com.google.android.exoplayer2.util.Log;
 import com.google.android.exoplayer2.util.Util;
-import java.net.CookieHandler;
-import java.net.CookieManager;
-import java.net.CookiePolicy;
+
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 
 /** An activity that plays media using {@link SimpleExoPlayer}. */
 public class PlayerActivity extends AppCompatActivity
@@ -78,13 +72,6 @@ public class PlayerActivity extends AppCompatActivity
   private static final String KEY_POSITION = "position";
   private static final String KEY_AUTO_PLAY = "auto_play";
 
-  private static final CookieManager DEFAULT_COOKIE_MANAGER;
-
-  static {
-    DEFAULT_COOKIE_MANAGER = new CookieManager();
-    DEFAULT_COOKIE_MANAGER.setCookiePolicy(CookiePolicy.ACCEPT_ORIGINAL_SERVER);
-  }
-
   protected StyledPlayerView playerView;
   protected LinearLayout debugRootView;
   protected TextView debugTextView;
@@ -96,16 +83,10 @@ public class PlayerActivity extends AppCompatActivity
   private List<MediaItem> mediaItems;
   private DefaultTrackSelector trackSelector;
   private DefaultTrackSelector.Parameters trackSelectorParameters;
-  private DebugTextViewHelper debugViewHelper;
   private TrackGroupArray lastSeenTrackGroupArray;
   private boolean startAutoPlay;
   private int startWindow;
   private long startPosition;
-
-  // Fields used only for ad playback.
-
-  private AdsLoader adsLoader;
-  private Uri loadedAdTagUri;
 
   // Activity lifecycle
 
@@ -113,9 +94,6 @@ public class PlayerActivity extends AppCompatActivity
   public void onCreate(Bundle savedInstanceState) {
     super.onCreate(savedInstanceState);
     dataSourceFactory = DemoUtil.getDataSourceFactory(/* context= */ this);
-    if (CookieHandler.getDefault() != DEFAULT_COOKIE_MANAGER) {
-      CookieHandler.setDefault(DEFAULT_COOKIE_MANAGER);
-    }
 
     setContentView();
     debugRootView = findViewById(R.id.controls_root);
@@ -145,7 +123,6 @@ public class PlayerActivity extends AppCompatActivity
   public void onNewIntent(Intent intent) {
     super.onNewIntent(intent);
     releasePlayer();
-    releaseAdsLoader();
     clearStartPosition();
     setIntent(intent);
   }
@@ -197,7 +174,6 @@ public class PlayerActivity extends AppCompatActivity
   @Override
   public void onDestroy() {
     super.onDestroy();
-    releaseAdsLoader();
   }
 
   @Override
@@ -275,13 +251,10 @@ public class PlayerActivity extends AppCompatActivity
         return false;
       }
 
-      boolean preferExtensionDecoders =
-          intent.getBooleanExtra(IntentUtil.PREFER_EXTENSION_DECODERS_EXTRA, false);
       RenderersFactory renderersFactory =
-          DemoUtil.buildRenderersFactory(/* context= */ this, preferExtensionDecoders);
+          DemoUtil.buildRenderersFactory(/* context= */ this, false);
       MediaSourceFactory mediaSourceFactory =
           new DefaultMediaSourceFactory(dataSourceFactory)
-              .setAdsLoaderProvider(this::getAdsLoader)
               .setAdViewProvider(playerView);
 
       trackSelector = new DefaultTrackSelector(/* context= */ this);
@@ -297,14 +270,9 @@ public class PlayerActivity extends AppCompatActivity
       player.setAudioAttributes(AudioAttributes.DEFAULT, /* handleAudioFocus= */ true);
       player.setPlayWhenReady(startAutoPlay);
       playerView.setPlayer(player);
-      debugViewHelper = new DebugTextViewHelper(player, debugTextView);
-      debugViewHelper.start();
     }
-    boolean haveStartPosition = startWindow != C.INDEX_UNSET;
-    if (haveStartPosition) {
-      player.seekTo(startWindow, startPosition);
-    }
-    player.setMediaItems(mediaItems, /* resetPosition= */ !haveStartPosition);
+
+    player.setMediaItems(mediaItems, /* resetPosition= */ false);
     player.prepare();
     updateButtonVisibility();
     return true;
@@ -321,7 +289,6 @@ public class PlayerActivity extends AppCompatActivity
 
     List<MediaItem> mediaItems =
         createMediaItems(intent, DemoUtil.getDownloadTracker(/* context= */ this));
-    boolean hasAds = false;
     for (int i = 0; i < mediaItems.size(); i++) {
       MediaItem mediaItem = mediaItems.get(i);
 
@@ -334,68 +301,19 @@ public class PlayerActivity extends AppCompatActivity
         // The player will be reinitialized if the permission is granted.
         return Collections.emptyList();
       }
+    }
 
-      MediaItem.DrmConfiguration drmConfiguration =
-          checkNotNull(mediaItem.playbackProperties).drmConfiguration;
-      if (drmConfiguration != null) {
-        if (Util.SDK_INT < 18) {
-          showToast(R.string.error_drm_unsupported_before_api_18);
-          finish();
-          return Collections.emptyList();
-        } else if (!FrameworkMediaDrm.isCryptoSchemeSupported(drmConfiguration.uuid)) {
-          showToast(R.string.error_drm_unsupported_scheme);
-          finish();
-          return Collections.emptyList();
-        }
-      }
-      hasAds |= mediaItem.playbackProperties.adTagUri != null;
-    }
-    if (!hasAds) {
-      releaseAdsLoader();
-    }
     return mediaItems;
-  }
-
-  private AdsLoader getAdsLoader(Uri adTagUri) {
-    if (mediaItems.size() > 1) {
-      showToast(R.string.unsupported_ads_in_playlist);
-      releaseAdsLoader();
-      return null;
-    }
-    if (!adTagUri.equals(loadedAdTagUri)) {
-      releaseAdsLoader();
-      loadedAdTagUri = adTagUri;
-    }
-    // The ads loader is reused for multiple playbacks, so that ad playback can resume.
-    if (adsLoader == null) {
-      adsLoader = new ImaAdsLoader.Builder(/* context= */ this).build();
-    }
-    adsLoader.setPlayer(player);
-    return adsLoader;
   }
 
   protected void releasePlayer() {
     if (player != null) {
       updateTrackSelectorParameters();
       updateStartPosition();
-      debugViewHelper.stop();
-      debugViewHelper = null;
       player.release();
       player = null;
       mediaItems = Collections.emptyList();
       trackSelector = null;
-    }
-    if (adsLoader != null) {
-      adsLoader.setPlayer(null);
-    }
-  }
-
-  private void releaseAdsLoader() {
-    if (adsLoader != null) {
-      adsLoader.release();
-      adsLoader = null;
-      loadedAdTagUri = null;
-      playerView.getOverlayFrameLayout().removeAllViews();
     }
   }
 
@@ -457,7 +375,7 @@ public class PlayerActivity extends AppCompatActivity
     @Override
     public void onPlaybackStateChanged(@Player.State int playbackState) {
       if (playbackState == Player.STATE_ENDED) {
-        showControls();
+        Log.i("Player state", "STATE_ENDED");
       }
       updateButtonVisibility();
     }
@@ -469,7 +387,7 @@ public class PlayerActivity extends AppCompatActivity
         initializePlayer();
       } else {
         updateButtonVisibility();
-        showControls();
+        Log.e("ExpoPlaybackException", "" + e.getMessage());
       }
     }
 
@@ -481,10 +399,6 @@ public class PlayerActivity extends AppCompatActivity
       if (trackGroups != lastSeenTrackGroupArray) {
         MappedTrackInfo mappedTrackInfo = trackSelector.getCurrentMappedTrackInfo();
         if (mappedTrackInfo != null) {
-          if (mappedTrackInfo.getTypeSupport(C.TRACK_TYPE_VIDEO)
-              == MappedTrackInfo.RENDERER_SUPPORT_UNSUPPORTED_TRACKS) {
-            showToast(R.string.error_unsupported_video);
-          }
           if (mappedTrackInfo.getTypeSupport(C.TRACK_TYPE_AUDIO)
               == MappedTrackInfo.RENDERER_SUPPORT_UNSUPPORTED_TRACKS) {
             showToast(R.string.error_unsupported_audio);
@@ -543,9 +457,7 @@ public class PlayerActivity extends AppCompatActivity
             .setUri(downloadRequest.uri)
             .setCustomCacheKey(downloadRequest.customCacheKey)
             .setMimeType(downloadRequest.mimeType)
-            .setStreamKeys(downloadRequest.streamKeys)
-            .setDrmKeySetId(downloadRequest.keySetId)
-            .setDrmLicenseRequestHeaders(getDrmRequestHeaders(item));
+            .setStreamKeys(downloadRequest.streamKeys);
 
         mediaItems.add(builder.build());
       } else {
@@ -553,11 +465,5 @@ public class PlayerActivity extends AppCompatActivity
       }
     }
     return mediaItems;
-  }
-
-  @Nullable
-  private static Map<String, String> getDrmRequestHeaders(MediaItem item) {
-    MediaItem.DrmConfiguration drmConfiguration = item.playbackProperties.drmConfiguration;
-    return drmConfiguration != null ? drmConfiguration.requestHeaders : null;
   }
 }
